@@ -1,0 +1,30 @@
+# Python virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Test and tool cache
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Local runtime data
+runtime/
+*.kohakutr
+
+# Temporary experiments
+sandbox/
+tmp/
+logs/
+
+# Operating system files
+.DS_Store
+Thumbs.db

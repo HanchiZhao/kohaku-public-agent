@@ -1,0 +1,11 @@
+[project]
+name = "kohaku-public-agent-lab"
+version = "0.1.0"
+description = "Public AI agent research and backend integration based on KohakuTerrarium."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "kohakuterrarium",
+]
+
+[tool.uv.sources]
+kohakuterrarium = { path = "../KohakuTerrarium", editable = true }
