@@ -7,7 +7,7 @@ from pathlib import Path
 
 @dataclass(frozen=True, slots=True)
 class SessionInfo:
-    """Public information about one managed Agent session."""
+    """Information about one managed Agent session."""
 
     public_id: str
     studio_session_id: str
@@ -18,11 +18,10 @@ class SessionInfo:
     is_busy: bool = False
 
     def to_dict(self) -> dict[str, str | bool]:
-        """Return a JSON-friendly representation for a future API layer."""
+        """Return fields that are safe to expose through a public API."""
         return {
             "session_id": self.public_id,
             "name": self.name,
-            "workspace": str(self.workspace),
             "created_at": self.created_at.isoformat(),
             "is_busy": self.is_busy,
         }
