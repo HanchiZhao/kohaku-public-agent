@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0"
+  >
+  <meta
+    name="description"
+    content="Kohaku Public Agent local development chat interface."
+  >
+  <title>Kohaku Public Agent</title>
+
+  <link
+    rel="stylesheet"
+    href="/static/styles.css"
+  >
+
+  <script
+    src="/static/app.js"
+    defer
+  ></script>
+</head>
+
+<body>
+  <div class="app-shell">
+    <aside
+      id="sidebar"
+      class="sidebar"
+      aria-label="对话列表"
+    >
+      <div class="sidebar-header">
+        <div class="brand">
+          <div
+            class="brand-mark"
+            aria-hidden="true"
+          >
+            K
+          </div>
+
+          <div>
+            <div class="brand-name">
+              Kohaku
+            </div>
+
+            <div class="brand-subtitle">
+              Public Agent
+            </div>
+          </div>
+        </div>
+
+        <div
+          id="healthIndicator"
+          class="health-indicator"
+          data-state="checking"
+          role="status"
+        >
+          <span
+            class="health-dot"
+            aria-hidden="true"
+          ></span>
+
+          <span id="healthText">
+            正在检查服务
+          </span>
+        </div>
+      </div>
+
+      <button
+        id="newSessionButton"
+        class="primary-button new-session-button"
+        type="button"
+      >
+        <span aria-hidden="true">＋</span>
+        新建对话
+      </button>
+
+      <div class="session-section-title">
+        对话记录
+      </div>
+
+      <nav
+        id="sessionList"
+        class="session-list"
+        aria-label="已有对话"
+      ></nav>
+
+      <div class="sidebar-footer">
+        <p>
+          本地研发版本
+        </p>
+
+        <p>
+          当前会话仅保存在本次服务器进程中
+        </p>
+      </div>
+    </aside>
+
+    <main class="main-panel">
+      <header class="topbar">
+        <div class="topbar-left">
+          <button
+            id="mobileMenuButton"
+            class="icon-button mobile-menu-button"
+            type="button"
+            aria-label="打开或关闭对话列表"
+          >
+            ☰
+          </button>
+
+          <div>
+            <div class="eyebrow">
+              Kohaku Public Agent
+            </div>
+
+            <h1 id="conversationTitle">
+              正在初始化
+            </h1>
+          </div>
+        </div>
+
+        <div class="topbar-actions">
+          <span
+            id="conversationStatus"
+            class="conversation-status"
+          >
+            未连接会话
+          </span>
+
+          <button
+            id="deleteSessionButton"
+            class="danger-text-button"
+            type="button"
+            disabled
+          >
+            删除对话
+          </button>
+        </div>
+      </header>
+
+      <div
+        id="errorBanner"
+        class="error-banner"
+        role="alert"
+        hidden
+      >
+        <span id="errorText"></span>
+
+        <button
+          id="dismissErrorButton"
+          class="error-close-button"
+          type="button"
+          aria-label="关闭错误提示"
+        >
+          ×
+        </button>
+      </div>
+
+      <section
+        id="messageList"
+        class="message-list"
+        aria-label="对话内容"
+        aria-live="polite"
+      >
+        <div
+          id="emptyState"
+          class="empty-state"
+        >
+          <div
+            class="empty-state-icon"
+            aria-hidden="true"
+          >
+            ✦
+          </div>
+
+          <h2>
+            我可以怎样帮助你？
+          </h2>
+
+          <p>
+            当前版本已经支持多轮会话、SSE
+            流式回答和停止生成。
+          </p>
+
+          <div class="suggestion-grid">
+            <button
+              class="suggestion-button"
+              type="button"
+              data-prompt="请介绍一下你的能力，以及当前尚未接入的功能。"
+            >
+              介绍你的能力
+            </button>
+
+            <button
+              class="suggestion-button"
+              type="button"
+              data-prompt="请用通俗的语言解释什么是人工智能 Agent。"
+            >
+              解释 AI Agent
+            </button>
+
+            <button
+              class="suggestion-button"
+              type="button"
+              data-prompt="请帮我制定一份学习人工智能开发的阶段计划。"
+            >
+              制定学习计划
+            </button>
+
+            <button
+              class="suggestion-button"
+              type="button"
+              data-prompt="请写一段简洁、专业的产品介绍文案。"
+            >
+              起草产品文案
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <footer class="composer-area">
+        <form
+          id="composerForm"
+          class="composer"
+        >
+          <label
+            class="visually-hidden"
+            for="messageInput"
+          >
+            输入消息
+          </label>
+
+          <textarea
+            id="messageInput"
+            rows="1"
+            maxlength="50000"
+            placeholder="输入消息，按 Enter 发送，Shift + Enter 换行"
+            autocomplete="off"
+          ></textarea>
+
+          <div class="composer-footer">
+            <div class="composer-information">
+              <span id="characterCount">
+                0 / 50000
+              </span>
+
+              <span>
+                AI 可能会犯错，请核实重要信息
+              </span>
+            </div>
+
+            <div class="composer-actions">
+              <button
+                id="stopButton"
+                class="stop-button"
+                type="button"
+                hidden
+              >
+                <span aria-hidden="true">■</span>
+                停止生成
+              </button>
+
+              <button
+                id="sendButton"
+                class="send-button"
+                type="submit"
+              >
+                发送
+                <span aria-hidden="true">↑</span>
+              </button>
+            </div>
+          </div>
+        </form>
+      </footer>
+    </main>
+  </div>
+
+  <div
+    id="sidebarBackdrop"
+    class="sidebar-backdrop"
+    hidden
+  ></div>
+</body>
+</html>

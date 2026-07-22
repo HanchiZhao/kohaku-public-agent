@@ -1,5 +1,5 @@
 name: kohaku-public-agent-lab
-version: "0.3.0"
+version: "0.4.0"
 description: "Public AI agent research package based on KohakuTerrarium."
 
 creatures:

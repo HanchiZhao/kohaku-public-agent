@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.agent_service import (
     AgentService,
@@ -19,6 +21,10 @@ from app.api.routes import router
 from app.api.schemas import HealthResponse
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+FRONTEND_DIR = PROJECT_ROOT / "frontend"
+INDEX_FILE = FRONTEND_DIR / "index.html"
+
 ServiceFactory = Callable[[], AgentService]
 
 
@@ -26,6 +32,16 @@ def create_app(
     service_factory: ServiceFactory = AgentService,
 ) -> FastAPI:
     """Create the FastAPI application."""
+
+    if not FRONTEND_DIR.is_dir():
+        raise RuntimeError(
+            f"Frontend directory does not exist: {FRONTEND_DIR}"
+        )
+
+    if not INDEX_FILE.is_file():
+        raise RuntimeError(
+            f"Frontend index file does not exist: {INDEX_FILE}"
+        )
 
     @asynccontextmanager
     async def lifespan(
@@ -46,11 +62,27 @@ def create_app(
         description=(
             "Development API for the public AI Agent platform."
         ),
-        version="0.3.0",
+        version="0.4.0",
         lifespan=lifespan,
     )
 
+    application.mount(
+        "/static",
+        StaticFiles(directory=str(FRONTEND_DIR)),
+        name="static",
+    )
+
     application.include_router(router)
+
+    @application.get(
+        "/",
+        include_in_schema=False,
+    )
+    async def frontend_index() -> FileResponse:
+        return FileResponse(
+            INDEX_FILE,
+            media_type="text/html",
+        )
 
     @application.get(
         "/health",
