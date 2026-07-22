@@ -41,6 +41,10 @@ class InvalidMessageError(AgentServiceError):
     """Raised when the user submits an invalid message."""
 
 
+class SessionBusyError(AgentServiceError):
+    """Raised when another turn is already running in the session."""
+
+
 @dataclass(slots=True)
 class _ManagedSession:
     """Internal mapping between public and KohakuTerrarium sessions."""
@@ -52,9 +56,11 @@ class _ManagedSession:
     workspace: Path
     created_at: datetime
     turn_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    state_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    is_generating: bool = False
 
     def snapshot(self) -> SessionInfo:
-        """Create an immutable public snapshot of this session."""
+        """Create an immutable public snapshot."""
         return SessionInfo(
             public_id=self.public_id,
             studio_session_id=self.studio_session_id,
@@ -62,7 +68,7 @@ class _ManagedSession:
             name=self.name,
             workspace=self.workspace,
             created_at=self.created_at,
-            is_busy=self.turn_lock.locked(),
+            is_busy=self.is_generating,
         )
 
 
@@ -70,8 +76,8 @@ class AgentService:
     """Long-running manager for public KohakuTerrarium sessions.
 
     One AgentService owns one Studio instance. Multiple public sessions
-    are created inside that Studio. Each session receives a separate
-    workspace and its own per-session turn lock.
+    run inside that Studio. Each session has an isolated workspace and
+    permits at most one active generation at a time.
     """
 
     def __init__(
@@ -125,10 +131,7 @@ class AgentService:
         await self.close()
 
     async def start(self) -> None:
-        """Start one long-running Studio instance.
-
-        Calling start more than once is safe and has no additional effect.
-        """
+        """Start one long-running Studio instance."""
         async with self._lifecycle_lock:
             if self._studio is not None:
                 return
@@ -150,10 +153,7 @@ class AgentService:
     async def close(self) -> None:
         """Stop all managed sessions and shut down Studio cleanly."""
         async with self._lifecycle_lock:
-            if self._studio is None:
-                return
-
-            if self._closing:
+            if self._studio is None or self._closing:
                 return
 
             self._closing = True
@@ -163,11 +163,11 @@ class AgentService:
         async with self._registry_lock:
             records = list(self._sessions.values())
 
-        # Interrupt active generations first so that their turn locks
-        # can be released before we stop the corresponding sessions.
+        # First interrupt any active model generations.
         for record in records:
             await self._safe_interrupt(studio, record)
 
+        # Then wait until every active turn releases its lock.
         for record in records:
             async with record.turn_lock:
                 with suppress(Exception):
@@ -194,7 +194,7 @@ class AgentService:
         *,
         name: str | None = None,
     ) -> SessionInfo:
-        """Create a new public Agent session and isolated workspace."""
+        """Create a new Agent session and isolated workspace."""
         studio = self._require_studio()
 
         public_id = uuid4().hex
@@ -251,8 +251,11 @@ class AgentService:
         public_id: str,
     ) -> SessionInfo:
         """Return one session's public metadata."""
+        self._require_studio()
         record = await self._get_record(public_id)
-        return record.snapshot()
+
+        async with record.state_lock:
+            return record.snapshot()
 
     async def list_sessions(self) -> list[SessionInfo]:
         """Return all managed sessions, oldest first."""
@@ -262,18 +265,21 @@ class AgentService:
             records = list(self._sessions.values())
 
         records.sort(key=lambda item: item.created_at)
-        return [record.snapshot() for record in records]
+
+        snapshots: list[SessionInfo] = []
+
+        for record in records:
+            async with record.state_lock:
+                snapshots.append(record.snapshot())
+
+        return snapshots
 
     async def stream_message(
         self,
         public_id: str,
         content: str,
     ) -> AsyncIterator[str]:
-        """Send one message and yield the Agent response incrementally.
-
-        Turns within the same session are serialized. Separate sessions
-        may generate responses concurrently.
-        """
+        """Send one message and yield the response incrementally."""
         studio = self._require_studio()
         record = await self._get_record(public_id)
 
@@ -282,42 +288,51 @@ class AgentService:
                 "Message content must be a non-empty string."
             )
 
-        async with record.turn_lock:
-            stream_result = studio.sessions.chat.chat(
-                record.studio_session_id,
-                record.creature_id,
-                content.strip(),
-            )
+        # Atomically reserve this session for one generation.
+        async with record.state_lock:
+            if record.is_generating:
+                raise SessionBusyError(
+                    f"Session is already generating: {public_id}"
+                )
 
-            # The current main branch returns an AsyncIterator directly.
-            # Some documented or older versions return an awaitable that
-            # resolves to an AsyncIterator. Supporting both makes this
-            # integration resilient to that API difference.
-            stream = await self._resolve_maybe_awaitable(
-                stream_result
-            )
+            record.is_generating = True
 
-            completed = False
+        try:
+            async with record.turn_lock:
+                stream_result = studio.sessions.chat.chat(
+                    record.studio_session_id,
+                    record.creature_id,
+                    content.strip(),
+                )
 
-            try:
-                async for chunk in stream:
-                    text = (
-                        chunk
-                        if isinstance(chunk, str)
-                        else str(chunk)
-                    )
+                stream = await self._resolve_maybe_awaitable(
+                    stream_result
+                )
 
-                    if text:
-                        yield text
+                completed = False
 
-                completed = True
+                try:
+                    async for chunk in stream:
+                        text = (
+                            chunk
+                            if isinstance(chunk, str)
+                            else str(chunk)
+                        )
 
-            finally:
-                # A browser disconnect or cancelled consumer may close the
-                # async generator before the Agent finishes. Interrupt it
-                # so the model call does not keep consuming resources.
-                if not completed:
-                    await self._safe_interrupt(studio, record)
+                        if text:
+                            yield text
+
+                    completed = True
+
+                finally:
+                    # This runs when a browser disconnects, a caller
+                    # cancels iteration, or the stream raises an error.
+                    if not completed:
+                        await self._safe_interrupt(studio, record)
+
+        finally:
+            async with record.state_lock:
+                record.is_generating = False
 
     async def chat(
         self,
@@ -353,14 +368,13 @@ class AgentService:
         if isinstance(resolved, dict):
             return resolved
 
-        # Defensive normalization for a future or older API shape.
         return {"history": resolved}
 
     async def interrupt(
         self,
         public_id: str,
     ) -> None:
-        """Interrupt the currently active turn for a session."""
+        """Interrupt the active generation for a session."""
         studio = self._require_studio()
         record = await self._get_record(public_id)
 
@@ -375,12 +389,7 @@ class AgentService:
         *,
         delete_workspace: bool = False,
     ) -> None:
-        """Stop and unregister a session.
-
-        The workspace is retained by default for debugging. The future
-        production API may delete or archive it according to a retention
-        policy.
-        """
+        """Stop and unregister a session."""
         studio = self._require_studio()
         record = await self._get_record(public_id)
 

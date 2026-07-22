@@ -5,6 +5,7 @@
     PublicSessionNotFoundError,
     ServiceClosingError,
     ServiceNotStartedError,
+    SessionBusyError,
 )
 from app.models import SessionInfo
 
@@ -15,5 +16,6 @@ __all__ = [
     "PublicSessionNotFoundError",
     "ServiceClosingError",
     "ServiceNotStartedError",
+    "SessionBusyError",
     "SessionInfo",
 ]

@@ -1,6 +1,6 @@
 [project]
 name = "kohaku-public-agent-lab"
-version = "0.2.0"
+version = "0.3.0"
 description = "Public AI agent research and backend integration based on KohakuTerrarium."
 requires-python = ">=3.12,<3.13"
 dependencies = [

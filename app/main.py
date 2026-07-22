@@ -13,6 +13,7 @@ from app.agent_service import (
     PublicSessionNotFoundError,
     ServiceClosingError,
     ServiceNotStartedError,
+    SessionBusyError,
 )
 from app.api.routes import router
 from app.api.schemas import HealthResponse
@@ -24,11 +25,7 @@ ServiceFactory = Callable[[], AgentService]
 def create_app(
     service_factory: ServiceFactory = AgentService,
 ) -> FastAPI:
-    """Create the FastAPI application.
-
-    A factory function makes the application easier to test because
-    automated tests can provide a fake AgentService.
-    """
+    """Create the FastAPI application."""
 
     @asynccontextmanager
     async def lifespan(
@@ -37,7 +34,6 @@ def create_app(
         service = service_factory()
 
         await service.start()
-
         application.state.agent_service = service
 
         try:
@@ -50,7 +46,7 @@ def create_app(
         description=(
             "Development API for the public AI Agent platform."
         ),
-        version="0.2.0",
+        version="0.3.0",
         lifespan=lifespan,
     )
 
@@ -106,6 +102,20 @@ def create_app(
 
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={"detail": str(exception)},
+        )
+
+    @application.exception_handler(
+        SessionBusyError
+    )
+    async def session_busy_handler(
+        request: Request,
+        exception: SessionBusyError,
+    ) -> JSONResponse:
+        del request
+
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
             content={"detail": str(exception)},
         )
 

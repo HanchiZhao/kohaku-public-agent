@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import TestCase
@@ -8,21 +10,21 @@ from fastapi.testclient import TestClient
 
 from app.agent_service import (
     PublicSessionNotFoundError,
+    SessionBusyError,
 )
 from app.main import create_app
 from app.models import SessionInfo
 
 
 class FakeAgentService:
-    """In-memory replacement used by API tests.
-
-    It verifies the HTTP layer without loading Studio or calling a model.
-    """
+    """In-memory service used to test the HTTP layer."""
 
     def __init__(self) -> None:
         self._started = False
         self._counter = 0
         self._sessions: dict[str, SessionInfo] = {}
+        self.busy_sessions: set[str] = set()
+        self.interrupted_sessions: set[str] = set()
 
     @property
     def is_started(self) -> bool:
@@ -34,6 +36,8 @@ class FakeAgentService:
     async def close(self) -> None:
         self._started = False
         self._sessions.clear()
+        self.busy_sessions.clear()
+        self.interrupted_sessions.clear()
 
     async def create_session(
         self,
@@ -65,7 +69,13 @@ class FakeAgentService:
     async def list_sessions(
         self,
     ) -> list[SessionInfo]:
-        return list(self._sessions.values())
+        return [
+            replace(
+                session,
+                is_busy=public_id in self.busy_sessions,
+            )
+            for public_id, session in self._sessions.items()
+        ]
 
     async def get_session(
         self,
@@ -78,7 +88,10 @@ class FakeAgentService:
                 f"Public session not found: {public_id}"
             )
 
-        return session
+        return replace(
+            session,
+            is_busy=public_id in self.busy_sessions,
+        )
 
     async def chat(
         self,
@@ -86,7 +99,35 @@ class FakeAgentService:
         content: str,
     ) -> str:
         await self.get_session(public_id)
+
+        if public_id in self.busy_sessions:
+            raise SessionBusyError(
+                f"Session is already generating: {public_id}"
+            )
+
         return f"Echo: {content}"
+
+    async def stream_message(
+        self,
+        public_id: str,
+        content: str,
+    ) -> AsyncIterator[str]:
+        await self.get_session(public_id)
+
+        if public_id in self.busy_sessions:
+            raise SessionBusyError(
+                f"Session is already generating: {public_id}"
+            )
+
+        yield "Echo: "
+        yield content
+
+    async def interrupt(
+        self,
+        public_id: str,
+    ) -> None:
+        await self.get_session(public_id)
+        self.interrupted_sessions.add(public_id)
 
     async def history(
         self,
@@ -117,10 +158,11 @@ class FakeAgentService:
 
         await self.get_session(public_id)
         self._sessions.pop(public_id)
+        self.busy_sessions.discard(public_id)
 
 
 class AgentApiTests(TestCase):
-    """Tests for the first non-streaming HTTP API."""
+    """Tests for the JSON and SSE HTTP API."""
 
     def setUp(self) -> None:
         self.service = FakeAgentService()
@@ -179,10 +221,7 @@ class AgentApiTests(TestCase):
             "/api/v1/sessions"
         )
 
-        self.assertEqual(
-            list_response.status_code,
-            200,
-        )
+        self.assertEqual(list_response.status_code, 200)
         self.assertEqual(
             list_response.json()["total"],
             1,
@@ -210,6 +249,66 @@ class AgentApiTests(TestCase):
         self.assertEqual(
             response.json()["response"],
             "Echo: Hello",
+        )
+
+    def test_stream_message_returns_sse_events(self) -> None:
+        session_id = self._create_session()
+
+        response = self.client.post(
+            (
+                f"/api/v1/sessions/{session_id}"
+                "/messages/stream"
+            ),
+            json={"content": "Hello stream"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(
+            response.headers["content-type"].startswith(
+                "text/event-stream"
+            )
+        )
+
+        body = response.text
+
+        self.assertIn("event: start", body)
+        self.assertIn("event: token", body)
+        self.assertIn('"text":"Echo: "', body)
+        self.assertIn('"text":"Hello stream"', body)
+        self.assertIn("event: done", body)
+        self.assertIn('"finish_reason":"stream_ended"', body)
+
+    def test_busy_stream_returns_409(self) -> None:
+        session_id = self._create_session()
+        self.service.busy_sessions.add(session_id)
+
+        response = self.client.post(
+            (
+                f"/api/v1/sessions/{session_id}"
+                "/messages/stream"
+            ),
+            json={"content": "Second request"},
+        )
+
+        self.assertEqual(response.status_code, 409)
+
+    def test_interrupt_endpoint(self) -> None:
+        session_id = self._create_session()
+        self.service.busy_sessions.add(session_id)
+
+        response = self.client.post(
+            f"/api/v1/sessions/{session_id}/interrupt"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()["status"],
+            "interrupt_requested",
+        )
+        self.assertTrue(response.json()["was_busy"])
+        self.assertIn(
+            session_id,
+            self.service.interrupted_sessions,
         )
 
     def test_empty_message_is_rejected(self) -> None:

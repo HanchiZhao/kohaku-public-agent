@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -36,7 +36,7 @@ class SessionResponse(StrictSchema):
 
 
 class SessionListResponse(StrictSchema):
-    """List of all sessions currently held by this service process."""
+    """List of all sessions held by this service process."""
 
     sessions: list[SessionResponse]
     total: int
@@ -57,6 +57,14 @@ class MessageResponse(StrictSchema):
 
     session_id: str
     response: str
+
+
+class InterruptResponse(StrictSchema):
+    """Result of requesting an interruption."""
+
+    session_id: str
+    status: Literal["interrupt_requested"]
+    was_busy: bool
 
 
 class HistoryResponse(StrictSchema):
