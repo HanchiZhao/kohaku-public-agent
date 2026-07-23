@@ -1,0 +1,12 @@
+name: public_assistant
+version: "0.5.0"
+
+base_config: "@kt-biome/creatures/general"
+
+# The current Codex model reserves the native function name "python".
+# Bracket format preserves all inherited tools without registering them
+# as provider-native functions.
+controller:
+  tool_format: bracket
+
+system_prompt_file: prompts/system.md
