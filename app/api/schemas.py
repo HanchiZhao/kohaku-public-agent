@@ -36,7 +36,7 @@ class SessionResponse(StrictSchema):
 
 
 class SessionListResponse(StrictSchema):
-    """List of all sessions held by this service process."""
+    """List of all restored and active sessions."""
 
     sessions: list[SessionResponse]
     total: int
@@ -75,7 +75,41 @@ class HistoryResponse(StrictSchema):
 
 
 class HealthResponse(StrictSchema):
-    """Application health status."""
+    """Lightweight application health status."""
 
-    status: str
+    status: Literal["ok", "degraded"]
     agent_service_started: bool
+    database_reachable: bool
+
+
+class SystemStatusResponse(StrictSchema):
+    """Detailed local development and persistence status."""
+
+    status: Literal["ok", "degraded"]
+
+    agent_service_started: bool
+    database_reachable: bool
+
+    live_sessions: int = Field(
+        ge=0,
+    )
+    busy_sessions: int = Field(
+        ge=0,
+    )
+
+    active_conversations: int = Field(
+        ge=0,
+    )
+    recovery_failed_conversations: int = Field(
+        ge=0,
+    )
+    deleted_conversations: int = Field(
+        ge=0,
+    )
+
+    missing_session_files: int = Field(
+        ge=0,
+    )
+    orphan_session_files: int = Field(
+        ge=0,
+    )

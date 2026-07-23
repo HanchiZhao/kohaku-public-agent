@@ -1,11 +1,21 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable
+from collections.abc import (
+    AsyncIterator,
+    Callable,
+)
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Request, status
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import (
+    FastAPI,
+    Request,
+    status,
+)
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+)
 from fastapi.staticfiles import StaticFiles
 
 from app.agent_service import (
@@ -19,13 +29,28 @@ from app.agent_service import (
 )
 from app.api.routes import router
 from app.api.schemas import HealthResponse
+from app.api.system_routes import (
+    database_is_reachable,
+    router as system_router,
+)
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-FRONTEND_DIR = PROJECT_ROOT / "frontend"
-INDEX_FILE = FRONTEND_DIR / "index.html"
+PROJECT_ROOT = Path(
+    __file__
+).resolve().parents[1]
 
-ServiceFactory = Callable[[], AgentService]
+FRONTEND_DIR = (
+    PROJECT_ROOT / "frontend"
+)
+
+INDEX_FILE = (
+    FRONTEND_DIR / "index.html"
+)
+
+ServiceFactory = Callable[
+    [],
+    AgentService,
+]
 
 
 def create_app(
@@ -35,12 +60,14 @@ def create_app(
 
     if not FRONTEND_DIR.is_dir():
         raise RuntimeError(
-            f"Frontend directory does not exist: {FRONTEND_DIR}"
+            "Frontend directory does not exist: "
+            f"{FRONTEND_DIR}"
         )
 
     if not INDEX_FILE.is_file():
         raise RuntimeError(
-            f"Frontend index file does not exist: {INDEX_FILE}"
+            "Frontend index file does not exist: "
+            f"{INDEX_FILE}"
         )
 
     @asynccontextmanager
@@ -50,7 +77,10 @@ def create_app(
         service = service_factory()
 
         await service.start()
-        application.state.agent_service = service
+
+        application.state.agent_service = (
+            service
+        )
 
         try:
             yield
@@ -60,19 +90,30 @@ def create_app(
     application = FastAPI(
         title="Kohaku Public Agent API",
         description=(
-            "Development API for the public AI Agent platform."
+            "Development API for the public "
+            "AI Agent platform."
         ),
-        version="0.4.0",
+        version="0.5.0",
         lifespan=lifespan,
     )
 
     application.mount(
         "/static",
-        StaticFiles(directory=str(FRONTEND_DIR)),
+        StaticFiles(
+            directory=str(
+                FRONTEND_DIR
+            )
+        ),
         name="static",
     )
 
-    application.include_router(router)
+    application.include_router(
+        router
+    )
+
+    application.include_router(
+        system_router
+    )
 
     @application.get(
         "/",
@@ -88,7 +129,7 @@ def create_app(
         "/health",
         response_model=HealthResponse,
         tags=["system"],
-        summary="Check API and AgentService health",
+        summary="Check API, AgentService and database health",
     )
     async def health(
         request: Request,
@@ -104,9 +145,29 @@ def create_app(
             and service.is_started
         )
 
+        database_reachable = (
+            await database_is_reachable(
+                service
+            )
+        )
+
+        healthy = (
+            started
+            and database_reachable
+        )
+
         return HealthResponse(
-            status="ok" if started else "degraded",
-            agent_service_started=started,
+            status=(
+                "ok"
+                if healthy
+                else "degraded"
+            ),
+            agent_service_started=(
+                started
+            ),
+            database_reachable=(
+                database_reachable
+            ),
         )
 
     @application.exception_handler(
@@ -119,8 +180,12 @@ def create_app(
         del request
 
         return JSONResponse(
-            status_code=status.HTTP_404_NOT_FOUND,
-            content={"detail": str(exception)},
+            status_code=(
+                status.HTTP_404_NOT_FOUND
+            ),
+            content={
+                "detail": str(exception),
+            },
         )
 
     @application.exception_handler(
@@ -133,8 +198,13 @@ def create_app(
         del request
 
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            content={"detail": str(exception)},
+            status_code=(
+                status
+                .HTTP_422_UNPROCESSABLE_ENTITY
+            ),
+            content={
+                "detail": str(exception),
+            },
         )
 
     @application.exception_handler(
@@ -147,8 +217,12 @@ def create_app(
         del request
 
         return JSONResponse(
-            status_code=status.HTTP_409_CONFLICT,
-            content={"detail": str(exception)},
+            status_code=(
+                status.HTTP_409_CONFLICT
+            ),
+            content={
+                "detail": str(exception),
+            },
         )
 
     @application.exception_handler(
@@ -164,8 +238,13 @@ def create_app(
         del request
 
         return JSONResponse(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={"detail": str(exception)},
+            status_code=(
+                status
+                .HTTP_503_SERVICE_UNAVAILABLE
+            ),
+            content={
+                "detail": str(exception),
+            },
         )
 
     @application.exception_handler(
@@ -178,8 +257,13 @@ def create_app(
         del request
 
         return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={"detail": str(exception)},
+            status_code=(
+                status
+                .HTTP_500_INTERNAL_SERVER_ERROR
+            ),
+            content={
+                "detail": str(exception),
+            },
         )
 
     return application
