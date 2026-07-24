@@ -14,6 +14,9 @@ from typing import Any
 from uuid import uuid4
 
 from kohakuterrarium import Studio, Terrarium
+from kohakuterrarium.studio.persistence.session_index import (
+    close_session_index,
+)
 
 from app.models import SessionInfo
 from app.persistence import (
@@ -287,12 +290,14 @@ class AgentService:
                 self._studio = None
                 self._exit_stack = None
 
-                await stack.aclose()
+                try:
+                    await stack.aclose()
+                finally:
+                    self._close_kohaku_session_index()
+                    self._restore_session_directory_environment()
 
-                self._restore_session_directory_environment()
-
-                if self._owns_database:
-                    await self.database.close()
+                    if self._owns_database:
+                        await self.database.close()
 
                 raise
 
@@ -342,6 +347,12 @@ class AgentService:
                 await studio.shutdown()
 
         finally:
+            # Studio shutdown closes individual SessionStore objects.
+            # The process-wide .kt-index.kvault singleton is separate
+            # and must be released before the session directory can
+            # be removed or rotated on Windows.
+            self._close_kohaku_session_index()
+
             async with self._lifecycle_lock:
                 self._studio = None
                 self._exit_stack = None
@@ -912,6 +923,24 @@ class AgentService:
         return Studio(
             engine=engine
         )
+
+    @staticmethod
+    def _close_kohaku_session_index() -> None:
+        """Release KohakuTerrarium's process-wide session index.
+
+        Studio shutdown closes individual .kohakutr stores, but the
+        shared .kt-index.kvault sidecar is a process-wide singleton and
+        must be closed separately. This is especially important on
+        Windows, where an open SQLite handle prevents temporary session
+        directories from being deleted.
+        """
+
+        try:
+            close_session_index()
+        except Exception:
+            logger.exception(
+                "Failed to close KohakuTerrarium session index."
+            )
 
     def _activate_session_directory_environment(
         self,
