@@ -1,0 +1,19 @@
+name: public_assistant
+version: "0.5.0"
+
+base_config: "@kt-biome/creatures/general"
+
+# Kohaku Public Agent is driven programmatically through FastAPI and Studio.
+# It must not inherit the blocking terminal CLI input loop from the base
+# creature, because CLIInput waits on sys.stdin.readline() in an executor
+# thread and prevents clean Python process shutdown on Windows.
+input:
+  type: none
+
+# The current Codex model reserves the native function name "python".
+# Bracket format preserves all inherited tools without registering them
+# as provider-native functions.
+controller:
+  tool_format: bracket
+
+system_prompt_file: prompts/system.md

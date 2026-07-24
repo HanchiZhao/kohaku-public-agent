@@ -1,316 +1,959 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, AsyncIterator
 
 import httpx
 
 
-BASE_URL = "http://127.0.0.1:8000"
+DEFAULT_BASE_URL = "http://127.0.0.1:8000"
+DEFAULT_INTERRUPT_ATTEMPTS = 5
+NORMAL_TIMEOUT = 90.0
+CONNECT_TIMEOUT = 15.0
+BUSY_TIMEOUT = 10.0
+IDLE_TIMEOUT = 15.0
+ABORT_TIMEOUT = 5.0
+CONTROL_TIMEOUT = 15.0
+POLL_INTERVAL = 0.02
+
+
+class InconclusiveInterruptAttempt(RuntimeError):
+    """The attempt ended without proving a real active interruption."""
 
 
 @dataclass(slots=True)
-class StreamResult:
-    """Collected result from one SSE response."""
+class Settings:
+    base_url: str
+    interrupt_attempts: int
 
-    token_count: int
-    text: str
-    done_received: bool
-    done_payload: dict[str, Any] | None
+
+@dataclass(slots=True)
+class Capture:
+    connected: asyncio.Event = field(default_factory=asyncio.Event)
+    start_received: bool = False
+    token_count: int = 0
+    chunks: list[str] = field(default_factory=list)
+    done_payload: dict[str, Any] | None = None
+    error_payload: dict[str, Any] | None = None
+
+    @property
+    def text(self) -> str:
+        return "".join(self.chunks)
+
+
+def parse_arguments() -> Settings:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Validate normal SSE transport and the browser-equivalent "
+            "live stop flow."
+        )
+    )
+    parser.add_argument(
+        "--base-url",
+        default=DEFAULT_BASE_URL,
+        help="FastAPI base URL. Default: %(default)s",
+    )
+    parser.add_argument(
+        "--interrupt-attempts",
+        type=int,
+        default=DEFAULT_INTERRUPT_ATTEMPTS,
+        help="Maximum fresh-session live stop attempts. Default: %(default)s",
+    )
+    args = parser.parse_args()
+
+    if not 1 <= args.interrupt_attempts <= 10:
+        parser.error("--interrupt-attempts must be between 1 and 10")
+
+    return Settings(
+        base_url=str(args.base_url).rstrip("/"),
+        interrupt_attempts=int(args.interrupt_attempts),
+    )
+
+
+def require_json_object(
+    response: httpx.Response,
+    label: str,
+) -> dict[str, Any]:
+    payload = response.json()
+
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            f"{label} was not a JSON object: {payload!r}"
+        )
+
+    return dict(payload)
 
 
 async def create_session(
     client: httpx.AsyncClient,
+    base_url: str,
     name: str,
 ) -> str:
-    """Create one temporary Agent session."""
     response = await client.post(
-        f"{BASE_URL}/api/v1/sessions",
+        f"{base_url}/api/v1/sessions",
         json={"name": name},
     )
     response.raise_for_status()
 
-    return str(response.json()["session_id"])
+    payload = require_json_object(
+        response,
+        "Create-session response",
+    )
+
+    session_id = payload.get("session_id")
+
+    if not session_id:
+        raise RuntimeError(
+            "Create-session response did not contain a valid session_id: "
+            f"{payload!r}"
+        )
+
+    return str(session_id)
 
 
 async def delete_session(
     client: httpx.AsyncClient,
+    base_url: str,
     session_id: str,
 ) -> None:
-    """Delete a temporary Agent session."""
     response = await client.delete(
-        f"{BASE_URL}/api/v1/sessions/{session_id}"
+        f"{base_url}/api/v1/sessions/{session_id}"
     )
+
+    if response.status_code == 404:
+        print(
+            "Temporary session was already deleted: "
+            f"{session_id}"
+        )
+        return
 
     if response.status_code != 204:
         raise RuntimeError(
             "Failed to delete temporary session "
-            f"{session_id}: {response.status_code} {response.text}"
+            f"{session_id}: "
+            f"{response.status_code} "
+            f"{response.text}"
         )
 
 
-async def consume_sse(
+async def get_status(
     client: httpx.AsyncClient,
+    base_url: str,
     session_id: str,
-    content: str,
-) -> StreamResult:
-    """Read one complete SSE response and print token events."""
+) -> dict[str, Any]:
+    response = await client.get(
+        f"{base_url}/api/v1/sessions/{session_id}"
+    )
+    response.raise_for_status()
+
+    payload = require_json_object(
+        response,
+        "Session-status response",
+    )
+
+    if not isinstance(
+        payload.get("is_busy"),
+        bool,
+    ):
+        raise RuntimeError(
+            "Session-status response did not contain boolean is_busy: "
+            f"{payload!r}"
+        )
+
+    return payload
+
+
+async def interrupt(
+    client: httpx.AsyncClient,
+    base_url: str,
+    session_id: str,
+) -> dict[str, Any]:
+    response = await client.post(
+        f"{base_url}/api/v1/sessions/{session_id}/interrupt"
+    )
+    response.raise_for_status()
+
+    payload = require_json_object(
+        response,
+        "Interrupt response",
+    )
+
+    if payload.get("session_id") != session_id:
+        raise RuntimeError(
+            "Interrupt returned the wrong session: "
+            f"{payload!r}"
+        )
+
+    if payload.get("status") != "interrupt_requested":
+        raise RuntimeError(
+            "Unexpected interrupt status: "
+            f"{payload!r}"
+        )
+
+    if not isinstance(
+        payload.get("was_busy"),
+        bool,
+    ):
+        raise RuntimeError(
+            "Interrupt omitted boolean was_busy: "
+            f"{payload!r}"
+        )
+
+    return payload
+
+
+def decode_sse_data(
+    raw_data: str,
+) -> dict[str, Any]:
+    try:
+        payload = json.loads(raw_data)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            f"SSE returned invalid JSON: {raw_data}"
+        ) from error
+
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            "SSE payload was not an object: "
+            f"{payload!r}"
+        )
+
+    return payload
+
+
+async def iter_sse(
+    response: httpx.Response,
+) -> AsyncIterator[
+    tuple[str, dict[str, Any]]
+]:
     current_event = ""
-    token_count = 0
-    text_chunks: list[str] = []
-    done_received = False
-    done_payload: dict[str, Any] | None = None
+
+    async for line in response.aiter_lines():
+        if not line:
+            current_event = ""
+            continue
+
+        if line.startswith("event:"):
+            current_event = line.split(
+                ":",
+                maxsplit=1,
+            )[1].strip()
+            continue
+
+        if line.startswith("data:"):
+            payload = decode_sse_data(
+                line.split(
+                    ":",
+                    maxsplit=1,
+                )[1].strip()
+            )
+
+            yield current_event, payload
+
+
+def validate_sse_response(
+    response: httpx.Response,
+) -> None:
+    response.raise_for_status()
+
+    content_type = response.headers.get(
+        "content-type",
+        "",
+    )
+
+    if not content_type.startswith(
+        "text/event-stream"
+    ):
+        raise RuntimeError(
+            "Streaming endpoint did not return text/event-stream. "
+            f"Received: {content_type}"
+        )
+
+
+async def consume_normal_stream(
+    client: httpx.AsyncClient,
+    base_url: str,
+    session_id: str,
+) -> Capture:
+    capture = Capture()
 
     async with client.stream(
         "POST",
         (
-            f"{BASE_URL}/api/v1/sessions/"
+            f"{base_url}/api/v1/sessions/"
             f"{session_id}/messages/stream"
         ),
-        json={"content": content},
-    ) as response:
-        response.raise_for_status()
-
-        content_type = response.headers.get(
-            "content-type",
-            "",
-        )
-
-        if not content_type.startswith("text/event-stream"):
-            raise RuntimeError(
-                "Streaming endpoint did not return text/event-stream. "
-                f"Received: {content_type}"
+        json={
+            "content": (
+                "请只回复下面这句话，不要添加解释："
+                "SSE 正常流式测试成功"
             )
+        },
+    ) as response:
+        validate_sse_response(response)
+        capture.connected.set()
 
-        async for line in response.aiter_lines():
-            if not line:
-                current_event = ""
-                continue
+        async for event, payload in iter_sse(
+            response
+        ):
+            if event == "start":
+                capture.start_received = True
 
-            if line.startswith("event:"):
-                current_event = line.split(
-                    ":",
-                    maxsplit=1,
-                )[1].strip()
-                continue
-
-            if not line.startswith("data:"):
-                continue
-
-            raw_data = line.split(
-                ":",
-                maxsplit=1,
-            )[1].strip()
-
-            payload = json.loads(raw_data)
-
-            if current_event == "token":
-                text = str(payload.get("text", ""))
-
-                if text:
-                    print(text, end="", flush=True)
-                    text_chunks.append(text)
-                    token_count += 1
-
-            elif current_event == "done":
-                done_received = True
-                done_payload = payload
-
-            elif current_event == "error":
-                raise RuntimeError(
-                    f"SSE error event received: {payload}"
+            elif event == "token":
+                text = str(
+                    payload.get(
+                        "text",
+                        "",
+                    )
                 )
 
-    return StreamResult(
-        token_count=token_count,
-        text="".join(text_chunks),
-        done_received=done_received,
-        done_payload=done_payload,
+                if text:
+                    print(
+                        text,
+                        end="",
+                        flush=True,
+                    )
+
+                    capture.chunks.append(text)
+                    capture.token_count += 1
+
+            elif event == "done":
+                capture.done_payload = payload
+                break
+
+            elif event == "error":
+                capture.error_payload = payload
+                break
+
+    return capture
+
+
+async def hold_live_stream(
+    client: httpx.AsyncClient,
+    base_url: str,
+    session_id: str,
+    prompt: str,
+    capture: Capture,
+) -> None:
+    async with client.stream(
+        "POST",
+        (
+            f"{base_url}/api/v1/sessions/"
+            f"{session_id}/messages/stream"
+        ),
+        json={
+            "content": prompt,
+        },
+    ) as response:
+        validate_sse_response(response)
+        capture.connected.set()
+
+        async for event, payload in iter_sse(
+            response
+        ):
+            if event == "start":
+                capture.start_received = True
+
+            elif event == "token":
+                text = str(
+                    payload.get(
+                        "text",
+                        "",
+                    )
+                )
+
+                if text:
+                    print(
+                        text,
+                        end="",
+                        flush=True,
+                    )
+
+                    capture.chunks.append(text)
+                    capture.token_count += 1
+
+            elif event == "done":
+                capture.done_payload = payload
+                break
+
+            elif event == "error":
+                capture.error_payload = payload
+                break
+
+
+async def raise_task_failure(
+    task: asyncio.Task[None],
+) -> None:
+    if task.cancelled():
+        return
+
+    error = task.exception()
+
+    if error is not None:
+        raise RuntimeError(
+            "The live SSE reader failed."
+        ) from error
+
+
+async def abort_stream(
+    task: asyncio.Task[None],
+) -> bool:
+    """Return True only when this function cancels the stream."""
+
+    if task.done():
+        await raise_task_failure(task)
+        return False
+
+    task.cancel()
+
+    try:
+        await asyncio.wait_for(
+            task,
+            timeout=ABORT_TIMEOUT,
+        )
+    except asyncio.CancelledError:
+        return True
+
+    except TimeoutError as error:
+        raise RuntimeError(
+            "The SSE client did not close within "
+            f"{ABORT_TIMEOUT:.0f} seconds."
+        ) from error
+
+    return True
+
+
+async def wait_connected(
+    capture: Capture,
+    task: asyncio.Task[None],
+) -> None:
+    try:
+        await asyncio.wait_for(
+            capture.connected.wait(),
+            timeout=CONNECT_TIMEOUT,
+        )
+    except TimeoutError as error:
+        if task.done():
+            await raise_task_failure(task)
+
+        raise RuntimeError(
+            "The live request did not establish an SSE response within "
+            f"{CONNECT_TIMEOUT:.0f} seconds."
+        ) from error
+
+
+async def wait_busy(
+    client: httpx.AsyncClient,
+    base_url: str,
+    session_id: str,
+    task: asyncio.Task[None],
+    capture: Capture,
+) -> tuple[
+    dict[str, Any],
+    int,
+]:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + BUSY_TIMEOUT
+
+    last_payload: dict[str, Any] | None = None
+    polls = 0
+
+    while loop.time() < deadline:
+        if capture.error_payload is not None:
+            raise RuntimeError(
+                "SSE returned an error before interruption: "
+                + json.dumps(
+                    capture.error_payload,
+                    ensure_ascii=False,
+                )
+            )
+
+        if task.done():
+            await raise_task_failure(task)
+
+            raise InconclusiveInterruptAttempt(
+                "The SSE response completed before "
+                "is_busy=true was observed."
+            )
+
+        last_payload = await get_status(
+            client,
+            base_url,
+            session_id,
+        )
+
+        polls += 1
+
+        if last_payload["is_busy"]:
+            return last_payload, polls
+
+        await asyncio.sleep(
+            POLL_INTERVAL
+        )
+
+    raise RuntimeError(
+        "The SSE connection opened, but the session never became busy "
+        f"within {BUSY_TIMEOUT:.0f} seconds. "
+        f"Last payload: {last_payload!r}"
     )
 
 
-async def interrupt_when_busy(
+async def wait_idle(
     client: httpx.AsyncClient,
+    base_url: str,
     session_id: str,
-    *,
-    timeout_seconds: float = 15.0,
 ) -> dict[str, Any]:
-    """Wait until the session is generating, then interrupt it."""
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout_seconds
+    deadline = loop.time() + IDLE_TIMEOUT
+
+    last_payload: dict[str, Any] | None = None
 
     while loop.time() < deadline:
-        status_response = await client.get(
-            f"{BASE_URL}/api/v1/sessions/{session_id}"
+        last_payload = await get_status(
+            client,
+            base_url,
+            session_id,
         )
-        status_response.raise_for_status()
 
-        if bool(status_response.json()["is_busy"]):
-            interrupt_response = await client.post(
-                (
-                    f"{BASE_URL}/api/v1/sessions/"
-                    f"{session_id}/interrupt"
-                )
-            )
-            interrupt_response.raise_for_status()
-
-            return dict(interrupt_response.json())
+        if not last_payload["is_busy"]:
+            return last_payload
 
         await asyncio.sleep(0.1)
 
     raise RuntimeError(
-        "The session did not enter the busy state before timeout."
+        "The interrupted session did not return to is_busy=false within "
+        f"{IDLE_TIMEOUT:.0f} seconds. "
+        f"Last payload: {last_payload!r}"
     )
 
 
-async def run_normal_stream_test(
-    client: httpx.AsyncClient,
+async def run_normal_test(
+    stream_client: httpx.AsyncClient,
+    control_client: httpx.AsyncClient,
+    base_url: str,
 ) -> None:
-    """Verify that normal SSE streaming produces text tokens."""
     session_id = await create_session(
-        client,
+        control_client,
+        base_url,
         "Normal SSE smoke test",
     )
 
     print()
-    print("=" * 60)
-    print("Test 1 — normal SSE token streaming")
-    print("=" * 60)
+    print("=" * 68)
+    print("Test 1 - normal SSE token streaming")
+    print("=" * 68)
     print(f"Session ID: {session_id}")
-    print()
-    print("Assistant: ", end="", flush=True)
+    print(
+        "Assistant: ",
+        end="",
+        flush=True,
+    )
 
     try:
-        result = await consume_sse(
-            client,
-            session_id,
-            "请只回复这一句话：SSE 正常流式测试成功",
+        try:
+            result = await asyncio.wait_for(
+                consume_normal_stream(
+                    stream_client,
+                    base_url,
+                    session_id,
+                ),
+                timeout=NORMAL_TIMEOUT,
+            )
+        except TimeoutError as error:
+            raise RuntimeError(
+                "Normal SSE did not finish within "
+                f"{NORMAL_TIMEOUT:.0f} seconds."
+            ) from error
+
+        print()
+
+        if not result.start_received:
+            raise RuntimeError(
+                "Normal SSE did not return a start event."
+            )
+
+        if (
+            result.token_count == 0
+            or not result.text.strip()
+        ):
+            raise RuntimeError(
+                "Normal SSE returned no visible token text."
+            )
+
+        if result.error_payload is not None:
+            raise RuntimeError(
+                "Normal SSE returned an error event: "
+                + json.dumps(
+                    result.error_payload,
+                    ensure_ascii=False,
+                )
+            )
+
+        if result.done_payload is None:
+            raise RuntimeError(
+                "Normal SSE did not return a done event."
+            )
+
+        if (
+            result.done_payload.get(
+                "finish_reason"
+            )
+            != "stream_ended"
+        ):
+            raise RuntimeError(
+                "Unexpected done payload: "
+                f"{result.done_payload!r}"
+            )
+
+        print(
+            "Token events received: "
+            f"{result.token_count}"
+        )
+        print(
+            f"Visible text: {result.text!r}"
+        )
+        print(
+            f"Done payload: {result.done_payload}"
+        )
+        print(
+            "Normal SSE streaming test passed."
         )
 
-        print()
-        print()
-
-        if result.token_count == 0:
-            raise RuntimeError(
-                "Normal streaming returned no token events."
-            )
-
-        if not result.text.strip():
-            raise RuntimeError(
-                "Normal streaming returned empty text."
-            )
-
-        if not result.done_received:
-            raise RuntimeError(
-                "Normal streaming did not return a done event."
-            )
-
-        print(f"Token events received: {result.token_count}")
-        print(f"Done payload: {result.done_payload}")
-        print("Normal SSE streaming test passed.")
-
     finally:
-        await delete_session(client, session_id)
+        await delete_session(
+            control_client,
+            base_url,
+            session_id,
+        )
 
 
-async def run_interrupt_test(
-    client: httpx.AsyncClient,
+def build_long_prompt(
+    attempt: int,
+) -> str:
+    upper_bound = (
+        2000
+        + (attempt - 1) * 500
+    )
+
+    return (
+        f"请从 1 开始逐行输出到 {upper_bound}。"
+        "每行只输出一个阿拉伯数字，"
+        "不要省略、总结、使用代码块或提前结束。"
+    )
+
+
+async def run_one_stop_attempt(
+    control_client: httpx.AsyncClient,
+    base_url: str,
+    attempt: int,
+    maximum: int,
 ) -> None:
-    """Verify that an active stream can be interrupted."""
     session_id = await create_session(
-        client,
-        "SSE interruption smoke test",
+        control_client,
+        base_url,
+        f"SSE interruption smoke test {attempt}",
     )
 
-    print()
-    print("=" * 60)
-    print("Test 2 — interruption of an active SSE response")
-    print("=" * 60)
-    print(f"Session ID: {session_id}")
-    print()
-    print("Assistant output before interruption: ")
-    print("-" * 60)
+    capture = Capture()
 
-    interrupt_task = asyncio.create_task(
-        interrupt_when_busy(
-            client,
-            session_id,
-        )
+    task: asyncio.Task[None] | None = None
+
+    print()
+    print("-" * 68)
+    print(
+        f"Live stop attempt {attempt}/{maximum}"
     )
+    print(
+        f"Session ID: {session_id}"
+    )
+    print(
+        "Interrupting as soon as the server reports is_busy=true."
+    )
+    print("-" * 68)
 
     try:
-        stream_result = await consume_sse(
-            client,
-            session_id,
-            (
-                "请详细介绍人工智能的发展历史、主要技术路线、"
-                "典型应用、社会影响与未来挑战，写成一篇很长的文章。"
-            ),
+        stream_timeout = httpx.Timeout(
+            connect=15.0,
+            read=None,
+            write=30.0,
+            pool=15.0,
         )
 
-        interrupt_payload = await interrupt_task
-
-        print()
-        print("-" * 60)
-        print(f"Interrupt response: {interrupt_payload}")
-        print(
-            "Token events received before interruption: "
-            f"{stream_result.token_count}"
-        )
-        print(
-            "Done event received: "
-            f"{stream_result.done_received}"
-        )
-        print(f"Done payload: {stream_result.done_payload}")
-
-        if not bool(interrupt_payload.get("was_busy")):
-            raise RuntimeError(
-                "Interrupt endpoint did not observe an active generation."
+        async with httpx.AsyncClient(
+            timeout=stream_timeout
+        ) as stream_client:
+            task = asyncio.create_task(
+                hold_live_stream(
+                    stream_client,
+                    base_url,
+                    session_id,
+                    build_long_prompt(
+                        attempt
+                    ),
+                    capture,
+                )
             )
 
-        # It is valid to receive zero tokens here. The interruption may
-        # happen during provider startup, before the first model token.
-        print("SSE interruption test passed.")
+            await wait_connected(
+                capture,
+                task,
+            )
 
-    finally:
-        if not interrupt_task.done():
-            interrupt_task.cancel()
+            busy_payload, polls = await wait_busy(
+                control_client,
+                base_url,
+                session_id,
+                task,
+                capture,
+            )
+
+            print()
+            print(
+                "[CONTROL] is_busy=true observed "
+                f"after {polls} poll(s):"
+            )
+            print(
+                json.dumps(
+                    busy_payload,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
 
             try:
-                await interrupt_task
-            except asyncio.CancelledError:
-                pass
+                interrupt_payload = await interrupt(
+                    control_client,
+                    base_url,
+                    session_id,
+                )
+            finally:
+                client_aborted = await abort_stream(
+                    task
+                )
 
-        await delete_session(client, session_id)
+            print()
+            print(
+                "[CONTROL] Interrupt response:"
+            )
+            print(
+                json.dumps(
+                    interrupt_payload,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+
+            if not interrupt_payload["was_busy"]:
+                final_state = await wait_idle(
+                    control_client,
+                    base_url,
+                    session_id,
+                )
+
+                raise InconclusiveInterruptAttempt(
+                    "The model finished between busy observation "
+                    "and the interrupt snapshot. "
+                    f"Final state: {final_state!r}"
+                )
+
+            if not client_aborted:
+                if capture.error_payload is not None:
+                    raise RuntimeError(
+                        "The stream returned an error before client abort: "
+                        + json.dumps(
+                            capture.error_payload,
+                            ensure_ascii=False,
+                        )
+                    )
+
+                raise InconclusiveInterruptAttempt(
+                    "was_busy=true was returned, but the stream had "
+                    "already ended before the browser-equivalent "
+                    "client abort."
+                )
+
+            final_state = await wait_idle(
+                control_client,
+                base_url,
+                session_id,
+            )
+
+            print()
+            print(
+                "SSE start received: "
+                f"{capture.start_received}"
+            )
+            print(
+                "Tokens before abort: "
+                f"{capture.token_count}"
+            )
+            print(
+                f"Partial text: {capture.text!r}"
+            )
+            print(
+                f"Final session state: {final_state}"
+            )
+            print(
+                "Browser-equivalent live stop attempt passed."
+            )
+
+    finally:
+        if (
+            task is not None
+            and not task.done()
+        ):
+            await abort_stream(task)
+
+        await delete_session(
+            control_client,
+            base_url,
+            session_id,
+        )
 
 
-async def main() -> None:
-    """Run independent streaming and interruption tests."""
-    async with httpx.AsyncClient(timeout=None) as client:
-        health_response = await client.get(
-            f"{BASE_URL}/health"
+async def run_stop_test(
+    control_client: httpx.AsyncClient,
+    base_url: str,
+    maximum_attempts: int,
+) -> None:
+    print()
+    print("=" * 68)
+    print(
+        "Test 2 - browser-equivalent live SSE stop flow"
+    )
+    print("=" * 68)
+    print(
+        "Test 1 separately verifies visible token and done events."
+    )
+    print(
+        "Test 2 requires SSE connection, is_busy=true, "
+        "was_busy=true, client abort, and final is_busy=false."
+    )
+
+    inconclusive: list[str] = []
+
+    for attempt in range(
+        1,
+        maximum_attempts + 1,
+    ):
+        try:
+            await run_one_stop_attempt(
+                control_client,
+                base_url,
+                attempt,
+                maximum_attempts,
+            )
+
+            print(
+                "SSE live stop test passed."
+            )
+            return
+
+        except InconclusiveInterruptAttempt as error:
+            inconclusive.append(
+                str(error)
+            )
+
+            print()
+            print(
+                f"[INCONCLUSIVE] {error}"
+            )
+
+            if attempt < maximum_attempts:
+                print(
+                    "Retrying with a new temporary session..."
+                )
+                await asyncio.sleep(1.0)
+
+    print()
+    print(
+        "Inconclusive attempt summary:"
+    )
+
+    for index, message in enumerate(
+        inconclusive,
+        start=1,
+    ):
+        print(
+            f"  {index}. {message}"
+        )
+
+    raise RuntimeError(
+        "Normal SSE passed, but no attempt proved the live browser "
+        "stop flow. The validation is failing rather than silently passing."
+    )
+
+
+async def run(
+    settings: Settings,
+) -> None:
+    stream_timeout = httpx.Timeout(
+        connect=15.0,
+        read=None,
+        write=30.0,
+        pool=15.0,
+    )
+
+    limits = httpx.Limits(
+        max_connections=20,
+        max_keepalive_connections=10,
+    )
+
+    async with (
+        httpx.AsyncClient(
+            timeout=stream_timeout,
+            limits=limits,
+        ) as stream_client,
+        httpx.AsyncClient(
+            timeout=CONTROL_TIMEOUT,
+            limits=limits,
+        ) as control_client,
+    ):
+        health_response = await control_client.get(
+            f"{settings.base_url}/health"
         )
         health_response.raise_for_status()
 
-        health_payload = health_response.json()
+        health = require_json_object(
+            health_response,
+            "Health response",
+        )
 
-        print(f"Health: {health_payload}")
+        print(
+            f"Health: {health}"
+        )
 
-        if health_payload.get("status") != "ok":
+        if health.get("status") != "ok":
             raise RuntimeError(
                 "The API health endpoint is not healthy."
             )
 
-        await run_normal_stream_test(client)
-        await run_interrupt_test(client)
+        await run_normal_test(
+            stream_client,
+            control_client,
+            settings.base_url,
+        )
+
+        await run_stop_test(
+            control_client,
+            settings.base_url,
+            settings.interrupt_attempts,
+        )
 
     print()
-    print("=" * 60)
-    print("All SSE smoke tests completed successfully")
-    print("=" * 60)
+    print("=" * 68)
+    print(
+        "All SSE smoke tests completed successfully"
+    )
+    print("=" * 68)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(
+        run(
+            parse_arguments()
+        )
+    )
