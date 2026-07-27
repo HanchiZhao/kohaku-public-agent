@@ -1,5 +1,5 @@
 name: public_assistant
-version: "0.5.0"
+version: "0.5.1"
 
 base_config: "@kt-biome/creatures/general"
 

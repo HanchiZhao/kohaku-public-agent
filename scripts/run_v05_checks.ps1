@@ -8,7 +8,13 @@ param(
     [string]$Mode = "quick",
 
     [ValidateRange(1, 10)]
-    [int]$SseRetries = 5
+    [int]$SseRetries = 5,
+
+    [ValidateRange(60, 3600)]
+    [int]$LiveOverallTimeoutSeconds = 900,
+
+    [ValidateRange(5, 120)]
+    [int]$LiveExitGraceSeconds = 30
 )
 
 $ErrorActionPreference = "Stop"
@@ -69,6 +75,34 @@ function Invoke-ExternalStep {
 
     Write-Host ""
     Write-Host "[PASS] $Name"
+}
+
+
+function Invoke-MonitoredPythonModule {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Module,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SuccessMarker
+    )
+
+    Invoke-ExternalStep `
+        -Name $Name `
+        -Command {
+            uv run python `
+                scripts/run_process_with_timeout.py `
+                --module $Module `
+                --label $Name `
+                --success-marker $SuccessMarker `
+                --overall-timeout-seconds `
+                $LiveOverallTimeoutSeconds `
+                --exit-grace-seconds `
+                $LiveExitGraceSeconds
+        }
 }
 
 
@@ -244,19 +278,33 @@ function Invoke-QuickChecks {
 function Invoke-LiveChecks {
     Write-Section "V0.5 live model validation"
 
-    Invoke-ExternalStep `
-        -Name "AgentService live smoke test" `
-        -Command {
-            uv run python `
-                -m app.smoke_service
-        }
+    Write-Host (
+        "Overall timeout per live process: " +
+        $LiveOverallTimeoutSeconds +
+        " seconds"
+    )
 
-    Invoke-ExternalStep `
+    Write-Host (
+        "Exit grace after success marker: " +
+        $LiveExitGraceSeconds +
+        " seconds"
+    )
+
+    Invoke-MonitoredPythonModule `
+        -Name "AgentService live smoke test" `
+        -Module "app.smoke_service" `
+        -SuccessMarker (
+            "AgentService smoke test " +
+            "completed successfully"
+        )
+
+    Invoke-MonitoredPythonModule `
         -Name "Restart recovery live smoke test" `
-        -Command {
-            uv run python `
-                -m app.smoke_restart_recovery
-        }
+        -Module "app.smoke_restart_recovery" `
+        -SuccessMarker (
+            "Real restart recovery smoke test " +
+            "completed successfully"
+        )
 }
 
 

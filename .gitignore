@@ -19,6 +19,14 @@ htmlcov/
 # Local runtime data
 runtime/
 *.kohakutr
+.kt-index.kvault
+*.kvault
+*.db
+*.sqlite
+*.sqlite3
+
+# Local source snapshots and handoff archives
+kohaku-public-agent-*.zip
 
 # Temporary experiments
 sandbox/

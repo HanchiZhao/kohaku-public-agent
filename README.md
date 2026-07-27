@@ -1,16 +1,16 @@
 # Kohaku Public Agent
 
 A multi-session public AI Agent prototype built with
-KohakuTerrarium, FastAPI, Server-Sent Events and SQLite.
+KohakuTerrarium, FastAPI, Server-Sent Events, SQLAlchemy and SQLite.
 
-The project is an application layer around KohakuTerrarium. It provides
-a browser chat interface and a stable HTTP API while delegating Agent
-execution, model context and operational session history to
-KohakuTerrarium.
+Kohaku Public Agent provides a browser chat interface and a stable
+public HTTP API. It delegates Agent execution, model context, tools,
+operational history and resumable session state to KohakuTerrarium.
 
 ## Current version
 
-`v0.5.0` — persistent conversation and restart recovery prototype.
+`v0.5.1` — stability, regression protection and developer
+documentation release.
 
 ## Current capabilities
 
@@ -21,18 +21,22 @@ KohakuTerrarium.
 - One active generation per conversation
 - Server-Sent Events streaming
 - Per-conversation interruption
+- Browser-equivalent stream cancellation
 - Conversation history retrieval
 - Output protocol marker filtering
 - Browser-side background generation
 - Stable public conversation IDs
 - SQLite product metadata
 - Persistent KohakuTerrarium `.kohakutr` sessions
-- Server restart recovery
+- Server restart and model-context recovery
+- Legacy runtime-binding repair
 - Soft deletion and workspace cleanup
 - Database and persistence health inspection
-- Automated and live smoke tests
+- Headless Agent input configuration
+- Windows process-shutdown regression protection
+- Unified Quick, Live, SSE and All validation modes
 
-## Architecture
+## Architecture overview
 
 ```text
 Browser frontend
@@ -55,40 +59,64 @@ SQLite product registry     KohakuTerrarium Studio
                               LLM provider
 ```
 
-### Responsibility boundaries
+Detailed architecture documentation is available at:
 
-The application SQLite database stores:
+```text
+docs/architecture.md
+```
 
-- Public conversation ID
-- User ownership metadata
+## Responsibility boundaries
+
+### Application SQLite database
+
+The application database stores product-level metadata:
+
+- Stable public conversation ID
+- Ownership metadata
 - Conversation title
 - Workspace path
-- Kohaku session file path
+- Kohaku session-file path
 - Current Studio session ID
 - Current Creature ID
-- Recovery and deletion status
+- Recovery status
+- Deletion status
+- Creation and update timestamps
 
-KohakuTerrarium stores:
+### KohakuTerrarium
+
+KohakuTerrarium stores and manages:
 
 - Agent operational state
 - Model conversation context
 - Conversation events and history
-- Tool and Creature state
+- Creature state
+- Tool state
 - Persistent `.kohakutr` session files
+- Studio sessions
+- Generation interruption
+- Session restoration
 
-The frontend never receives the internal Studio session ID,
-Creature ID or filesystem paths.
+The frontend never receives internal Studio session IDs, Creature IDs,
+session-file paths or workspace paths.
 
 ## Repository layout
 
 ```text
 app/
-├─ api/                  FastAPI routes and schemas
-├─ persistence/          SQLite database and repository layer
-├─ agent_service.py      Long-running Studio and session manager
-├─ main.py               FastAPI application and lifespan
-├─ models.py             Internal public session model
-└─ smoke_*.py            Integration smoke tests
+├─ api/
+│  ├─ dependencies.py
+│  ├─ routes.py
+│  ├─ schemas.py
+│  └─ system_routes.py
+├─ persistence/
+│  ├─ database.py
+│  ├─ records.py
+│  ├─ repository.py
+│  └─ tables.py
+├─ agent_service.py
+├─ main.py
+├─ models.py
+└─ smoke_*.py
 
 creatures/
 └─ public-assistant/
@@ -104,12 +132,25 @@ frontend/
 scripts/
 ├─ inspect_studio_persistence.py
 ├─ persistence_doctor.py
+├─ run_process_with_timeout.py
+├─ run_v05_checks.ps1
 └─ smoke_sse_client.py
 
 tests/
 ├─ capability/
+│  ├─ test_models.py
+│  ├─ test_persistence.py
+│  ├─ test_public_assistant_config.py
+│  └─ test_service_guards.py
 ├─ integration/
+│  ├─ test_agent_service_live.py
+│  ├─ test_api.py
+│  ├─ test_fronted.py
+│  ├─ test_index_shutdown.py
+│  ├─ test_restart_recovery.py
+│  └─ test_system_status.py
 └─ safety/
+   └─ test_process_timeout_runner.py
 ```
 
 ## Prerequisites
@@ -118,7 +159,9 @@ tests/
 - Python 3.12
 - `uv`
 - Git
+- Node.js for JavaScript syntax checks
 - A configured KohakuTerrarium-supported model provider
+- A local KohakuTerrarium checkout
 
 The current development dependency uses a local editable
 KohakuTerrarium checkout. Keep both repositories next to each other:
@@ -134,7 +177,7 @@ C:\AgentProjects\
 Open PowerShell in the project directory:
 
 ```powershell
-cd C:\AgentProjects\public-agent-lab
+Set-Location "C:\AgentProjects\public-agent-lab"
 ```
 
 Synchronize dependencies:
@@ -143,13 +186,13 @@ Synchronize dependencies:
 uv sync --system-certs
 ```
 
-Install this Agent package in editable mode:
+Install the Agent package in editable mode:
 
 ```powershell
 uv run kt install . -e
 ```
 
-Check installed packages:
+Check installed Kohaku packages:
 
 ```powershell
 uv run kt list
@@ -162,25 +205,58 @@ kohaku-public-agent-lab
 Creatures: public-assistant
 ```
 
-Configure and authenticate an LLM provider through
-KohakuTerrarium before running live Agent requests.
+Configure and authenticate a supported LLM provider through
+KohakuTerrarium before running Live or SSE validation.
+
+## Environment variables
+
+The repository contains:
+
+```text
+.env.example
+```
+
+It documents the application-specific environment variables.
+
+Important:
+
+> The application currently does not automatically load `.env` files.
+
+`.env.example` is a reference template. Values must be supplied through
+PowerShell, the operating-system environment or the deployment
+environment.
+
+Example PowerShell configuration:
+
+```powershell
+$env:PUBLIC_AGENT_DATABASE_URL = `
+    "sqlite+aiosqlite:///./runtime/data/public_agent.db"
+
+$env:KT_SESSION_DIR = `
+    "C:\AgentProjects\public-agent-lab\runtime\kohaku_sessions"
+```
+
+Both variables are optional during normal local development because the
+application provides project-local defaults.
 
 ## Run the application
 
+Start Uvicorn:
+
 ```powershell
 uv run uvicorn app.main:app `
-  --reload `
-  --host 127.0.0.1 `
-  --port 8000
+    --reload `
+    --host 127.0.0.1 `
+    --port 8000
 ```
 
-Open:
+Open the browser application:
 
 ```text
 http://127.0.0.1:8000/
 ```
 
-API documentation:
+Open API documentation:
 
 ```text
 http://127.0.0.1:8000/docs
@@ -230,26 +306,29 @@ runtime/
 
 The entire `runtime/` directory is excluded from Git.
 
-Do not commit:
+The following files must never be committed:
 
+- `.env`
+- API keys
+- Authentication tokens
+- OAuth credentials
 - SQLite databases
 - `.kohakutr` files
+- `.kvault` files
 - User workspaces
-- Authentication tokens
-- API keys
-- OAuth files
-- `.env` files
+- Local source snapshots
+- Local handoff archives
 
 ## Persistence behavior
 
-Creating a conversation performs the following operations:
+Creating a conversation performs:
 
 ```text
-Create stable public ID
+Generate stable public ID
 → Create isolated workspace
 → Start KohakuTerrarium Creature
-→ Resolve the real .kohakutr session file
-→ Write the public-to-runtime mapping into SQLite
+→ Resolve the real .kohakutr file
+→ Store public-to-runtime mapping in SQLite
 ```
 
 Application restart performs:
@@ -259,18 +338,19 @@ Start SQLite
 → Start persistent Studio
 → Read active conversation mappings
 → Resume each .kohakutr session
-→ Refresh live Studio and Creature IDs
+→ Refresh Studio and Creature IDs
+→ Repair stale runtime bindings
 → Return restored conversations to the browser
 ```
 
-Deleting a conversation:
+Deleting a conversation performs:
 
 ```text
 Interrupt active generation
 → Mark the SQLite row as deleted
 → Stop the live Studio session
 → Delete the Kohaku session family
-→ Optionally remove the workspace
+→ Remove the workspace when requested
 ```
 
 ## Persistence diagnostics
@@ -281,7 +361,7 @@ Run the read-only persistence doctor:
 uv run python scripts/persistence_doctor.py
 ```
 
-JSON output:
+Produce JSON output:
 
 ```powershell
 uv run python scripts/persistence_doctor.py --json
@@ -299,145 +379,302 @@ The doctor reports:
 - Recovery failures
 - Missing session files
 - Orphan session files
-- Deleted rows with files remaining
+- Deleted rows with session files remaining
 
-It does not modify the database or filesystem.
+The doctor does not modify the database or filesystem.
 
-## Tests
+## Unified validation runner
 
-Compile Python files:
+The validation entry point remains named:
 
-```powershell
-uv run python -m compileall app scripts tests
+```text
+scripts/run_v05_checks.ps1
 ```
 
-Run all non-live tests:
+The filename is retained for compatibility with the v0.5 release family.
+The script validates the current v0.5.1 codebase.
+
+### Quick mode
 
 ```powershell
-Remove-Item Env:RUN_LIVE_AGENT_TESTS `
-  -ErrorAction SilentlyContinue
-
-uv run python -m unittest discover `
-  -s tests `
-  -t . `
-  -v
+powershell -ExecutionPolicy Bypass `
+    -File .\scripts\run_v05_checks.ps1 `
+    -Mode quick
 ```
 
-Run SQLite persistence tests:
+Quick mode performs:
+
+- Python compilation
+- JavaScript syntax validation
+- Git whitespace validation
+- Complete non-live unittest discovery
+- Public Assistant effective-config regression tests
+- Process-monitor safety tests
+- Session-index shutdown regression
+- Strict persistence diagnostics
+
+Quick mode does not require Uvicorn or a live model request.
+
+### Live mode
 
 ```powershell
-uv run python -m unittest `
-  tests.capability.test_persistence `
-  -v
+powershell -ExecutionPolicy Bypass `
+    -File .\scripts\run_v05_checks.ps1 `
+    -Mode live
 ```
 
-Run restart recovery tests without a model request:
+Live mode performs:
+
+- Real AgentService model smoke test
+- Real multi-turn context validation
+- Real restart recovery validation
+- Model-context recovery after service reconstruction
+- Full child-process exit monitoring
+
+Each Live smoke test must:
+
+```text
+Print its success marker
++
+Return exit code 0
++
+Terminate the complete Python process within the exit grace period
+```
+
+A smoke-test body printing success is not sufficient by itself.
+
+Optional timeout overrides:
 
 ```powershell
-uv run python -m unittest `
-  tests.integration.test_restart_recovery `
-  -v
+powershell -ExecutionPolicy Bypass `
+    -File .\scripts\run_v05_checks.ps1 `
+    -Mode live `
+    -LiveOverallTimeoutSeconds 900 `
+    -LiveExitGraceSeconds 30
 ```
 
-Run the real long-running AgentService smoke test:
+### SSE mode
+
+Start Uvicorn in a separate terminal:
 
 ```powershell
-uv run python -m app.smoke_service
+uv run uvicorn app.main:app `
+    --reload `
+    --host 127.0.0.1 `
+    --port 8000
 ```
 
-Run the real restart recovery smoke test:
+Then run:
 
 ```powershell
-uv run python -m app.smoke_restart_recovery
+powershell -ExecutionPolicy Bypass `
+    -File .\scripts\run_v05_checks.ps1 `
+    -Mode sse
 ```
 
-Run the SSE client smoke test while Uvicorn is running:
+SSE mode validates:
+
+- `/health`
+- `/api/v1/system/status`
+- Normal SSE start/token/done behavior
+- Real active-generation interruption
+- `/interrupt` returning `was_busy=true`
+- Browser-equivalent client-stream cancellation
+- Final recovery to `is_busy=false`
+
+### All mode
+
+With Uvicorn running in another terminal:
 
 ```powershell
-uv run python scripts/smoke_sse_client.py
+powershell -ExecutionPolicy Bypass `
+    -File .\scripts\run_v05_checks.ps1 `
+    -Mode all
 ```
 
-## Model and tool compatibility
+All mode runs:
 
-The current public assistant inherits the general Creature configuration
-from `kt-biome`.
+```text
+Quick
+→ Live
+→ SSE
+```
 
-The Creature uses bracket tool format because the current Codex-backed
-model reserves the provider-native function name `python`.
+Any failed command, failed assertion, persistence anomaly, timeout or
+non-zero exit code fails the complete validation.
 
-This preserves inherited tools without registering `python` as a native
-provider function.
+## Public Assistant configuration contracts
 
-## Development status
+The Public Assistant inherits:
+
+```yaml
+base_config: "@kt-biome/creatures/general"
+```
+
+It explicitly overrides two important settings.
+
+### Headless input
+
+```yaml
+input:
+  type: none
+```
+
+The web application supplies user messages programmatically through
+FastAPI and AgentService. It must not inherit terminal CLI input.
+
+CLI input can start a blocking `sys.stdin.readline()` executor thread.
+On Windows, that thread can prevent the Python interpreter from exiting
+after a smoke-test body has already completed.
+
+The effective configuration is protected by an automated regression
+test.
+
+### Bracket tool format
+
+```yaml
+controller:
+  tool_format: bracket
+```
+
+The current model integration reserves the provider-native function name
+`python`. Bracket formatting preserves inherited tools without
+registering that name as a provider-native function.
+
+## Shutdown behavior
+
+Application shutdown performs:
+
+```text
+Reject new work
+→ Interrupt active generations
+→ Wait for per-session locks
+→ Stop Studio sessions
+→ Close Studio
+→ Close the process-wide Kohaku session index
+→ Restore environment variables
+→ Close the database
+```
+
+Closing the process-wide session index is required to release:
+
+```text
+.kt-index.kvault
+```
+
+The Live validation runner starts the smoke tests as child processes and
+requires each complete Python process to exit after reporting success.
+
+This protects against interpreter-exit hangs caused by residual threads,
+executors or open runtime resources.
+
+## Development safety boundary
 
 This repository is a development prototype, not a production-ready
 public service.
 
-The current version does not yet provide:
+The current version does not provide:
 
-- User registration and login
+- User registration or login
 - Real multi-user authorization
+- Conversation ownership enforcement
 - Rate limiting
 - Per-user model quotas
 - Production secret management
 - File upload
-- Document analysis
-- Web search with citations
+- Document-analysis isolation
 - Tool approval UI
-- Production database migrations
-- PostgreSQL or Redis
+- Sandboxed code execution
+- PostgreSQL
+- Redis
 - Horizontal scaling
-- HTTPS deployment
+- HTTPS termination
 - Production monitoring
 - Content moderation pipeline
+- Backup and disaster-recovery automation
 
-Do not expose the current local server directly to the public internet.
+Do not expose the current Uvicorn server directly to the public
+internet.
+
+The current recommended use cases are:
+
+- Local development
+- Controlled internal testing
+- Private-network demonstrations
+- Architecture and persistence experiments
+
+## Release workflow
+
+The expected release workflow is:
+
+```text
+Create feature branch
+→ Run Quick during development
+→ Run Live after runtime changes
+→ Start Uvicorn
+→ Run All before release
+→ Review git diff
+→ Commit exact files
+→ Push feature branch
+→ Create Pull Request
+→ Review Files changed
+→ Merge into main
+→ Pull main locally
+→ Run post-merge Quick
+→ Create annotated tag
+→ Publish GitHub Pre-release
+```
+
+Do not use `git add .` when unrelated local files may be present.
 
 ## Roadmap
 
-### v0.6 — user identity and isolation
+### v0.6 — identity and access isolation
 
 - User model
 - Authentication
-- Conversation ownership enforcement
-- Session cookies or tokens
-- Per-user quotas
+- Conversation ownership
+- Authorization enforcement
+- Secure session cookies
+- Per-user limits
 
-### v0.7 — files and document analysis
+### v0.7 — quotas and cost controls
+
+- Rate limiting
+- Concurrent-generation limits
+- Token accounting
+- Request budgets
+- Storage quotas
+
+### v0.8 — files and document analysis
 
 - Secure uploads
-- File type and size validation
-- Per-user storage isolation
-- TXT, Markdown, PDF and DOCX analysis
+- File ownership
+- File-size and type validation
+- Workspace isolation
+- PDF, DOCX, TXT, Markdown and CSV processing
 
-### v0.8 — web research
-
-- Web search
-- Page retrieval
-- Source citations
-- Research Agent
-
-### v0.9 — tools and approvals
+### v0.9 — safe tools and approvals
 
 - Structured tool events
 - User approval workflow
-- Audit records
-- Safe code and data tools
+- Tool-call audit records
+- Sandboxed code and data tools
 
-### v1.0 — production deployment
+### v1.0 — controlled production deployment
 
 - PostgreSQL
 - Redis
-- Docker
 - HTTPS
+- Reverse proxy
+- Backups
 - Monitoring
-- Rate limits
 - Usage accounting
-- Production model credentials
+- Production credential management
 
 ## License and attribution
 
-This repository contains the application code developed for the
+This repository contains application code developed for the
 Kohaku Public Agent project.
 
 KohakuTerrarium and `kt-biome` are independent upstream projects and
